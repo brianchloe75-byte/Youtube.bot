@@ -1,5 +1,4 @@
 aiogram==3.26.0
 yt-dlp==2026.3.17
 aiohttp==3.13.5
-python-dontev==1.2.2
 requests==2.31.0
