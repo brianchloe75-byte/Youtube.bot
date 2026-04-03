@@ -1,93 +1,83 @@
 import os
-import asyncio
 import time
+import json
 import random
+import asyncio
+import logging
 import yt_dlp
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
-# =========================
-# Safety: load env variables
-# =========================
-TOKEN = os.environ.get("TOKEN")
-if not TOKEN:
-    raise ValueError("ERROR: TOKEN environment variable not set!")
+# -------------------------------
+# CONFIG
+# -------------------------------
+TOKEN = os.getenv("YT_TOKEN")
+BOT_USERNAME = os.getenv("YT_BOT_USERNAME", "EarthsBestDownloader_bot")
 
-# Optional: main bot username for redirect
-MAIN_BOT = os.environ.get("MAIN_BOT_USERNAME", "@BrayC_bot")
+logging.basicConfig(level=logging.INFO)
 
-# =========================
-# Bot & Dispatcher
-# =========================
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
-# =========================
-# Download folder
-# =========================
-DOWNLOADS_DIR = "downloads"
-if not os.path.exists(DOWNLOADS_DIR):
-    os.makedirs(DOWNLOADS_DIR)
+# -------------------------------
+# STORAGE SETUP
+# -------------------------------
+if not os.path.exists("downloads"):
+    os.makedirs("downloads")
 
-# =========================
-# Queue system
-# =========================
-semaphore = asyncio.Semaphore(2)  # only 2 active downloads
+DATA_FILE = "yt_data.json"
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w") as f:
+        json.dump({"users": [], "downloads": 0, "referrals": {}}, f)
 
-# =========================
-# Cache
-# =========================
-user_data = {}
+cache = {}
+semaphore = asyncio.Semaphore(2)
+cooldown = {}
 
-# =========================
-# Render keep-alive server
-# =========================
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Alive")
+# -------------------------------
+# WEB SERVER (ASYNC)
+# -------------------------------
+async def handle(request):
+    return web.Response(text="Alive")
 
-def run_web():
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
     port = int(os.environ.get("PORT", 10000))
-    print(f"Web server listening on port {port}")
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
-threading.Thread(target=run_web).start()
+# -------------------------------
+# DATA HELPERS
+# -------------------------------
+def load_data():
+    with open(DATA_FILE) as f:
+        return json.load(f)
 
-# =========================
-# Proxy rotation (optional)
-# =========================
-PROXIES = [None]  # add proxies here if needed
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
+
+# -------------------------------
+# PROXIES
+# -------------------------------
+PROXIES = [
+    None,
+    # "http://user:pass@ip:port"
+]
 
 def get_random_proxy():
     return random.choice(PROXIES)
 
-# =========================
-# yt-dlp options
-# =========================
-def get_opts(filename, fmt):
-    return {
-        "format": fmt,
-        "outtmpl": filename,
-        "quiet": True,
-        "nocheckcertificate": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 10,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
-        "proxy": get_random_proxy()
-    }
-
-# =========================
-# Download function
-# =========================
+# -------------------------------
+# DOWNLOAD FUNCTION
+# -------------------------------
 def download_video(url, user_id, choice):
-    filename = f"{DOWNLOADS_DIR}/{user_id}_{int(time.time())}.%(ext)s"
+    filename = f"downloads/{user_id}_{int(time.time())}.%(ext)s"
 
     formats = {
         "hd": ["bestvideo+bestaudio", "best"],
@@ -95,112 +85,189 @@ def download_video(url, user_id, choice):
         "audio": ["bestaudio"]
     }
 
-    last_error = None
     for attempt in range(3):
         for fmt in formats[choice]:
             try:
-                with yt_dlp.YoutubeDL(get_opts(filename, fmt)) as ydl:
+                opts = {
+                    "format": fmt,
+                    "outtmpl": filename,
+                    "quiet": True,
+                    "retries": 3,
+                    "fragment_retries": 3,
+                    "socket_timeout": 15,
+                    "proxy": get_random_proxy(),
+                }
+
+                with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    file_path = ydl.prepare_filename(info)
-                    if os.path.exists(file_path):
-                        return file_path, info
+                    path = ydl.prepare_filename(info)
+
+                    if os.path.exists(path):
+                        return path
+
             except Exception as e:
-                last_error = e
+                print("Retry error:", e)
                 continue
-        time.sleep(1)
 
-    raise Exception(f"Download failed: {last_error}")
+        time.sleep(2)
 
-# =========================
-# Start command
-# =========================
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await message.reply(
-        f"🎬 YouTube Bot\n\n"
-        f"⚡ Only handles YouTube links\n\n"
-        f"🚀 Send a YouTube link to download"
-    )
+    raise Exception("Download failed")
 
-# =========================
-# Handle messages
-# =========================
-@dp.message_handler()
-async def handle_link(message: types.Message):
-    url = message.text.strip()
+# -------------------------------
+# START COMMAND
+# -------------------------------
+@dp.message()
+async def handle_all(message: types.Message):
+    text = message.text
+
+    if text.startswith("/start"):
+        user_id = str(message.from_user.id)
+        args = text.replace("/start", "").strip()
+
+        data = load_data()
+
+        if user_id not in data["users"]:
+            data["users"].append(user_id)
+            if args:
+                data["referrals"][args] = data["referrals"].get(args, 0) + 1
+
+        save_data(data)
+
+        return await message.answer(
+            "🔥 YouTube Downloader\n\n"
+            "⚡ Fast | Smart Retry Enabled\n"
+            "🎯 Send a YouTube link\n\n"
+            "🚀 Invite friends to grow!",
+            parse_mode="Markdown"
+        )
+
+    if text == "/stats":
+        data = load_data()
+        user_id = str(message.from_user.id)
+
+        return await message.answer(
+            f"📊 Users: {len(data['users'])}\n"
+            f"⬇️ Downloads: {data['downloads']}\n"
+            f"👥 Referrals: {data['referrals'].get(user_id, 0)}"
+        )
+
+    # -------------------------------
+    # HANDLE YOUTUBE LINK
+    # -------------------------------
+    url = text.strip()
     user_id = message.from_user.id
 
     if "youtube" not in url.lower():
-        return await message.reply(
-            f"⚠️ This bot only downloads YouTube videos.\n"
-            f"Please use the main bot for other platforms: {MAIN_BOT}"
-        )
+        return await message.reply("❌ Only YouTube links allowed.")
+
+    # cooldown
+    if time.time() - cooldown.get(user_id, 0) < 10:
+        return await message.reply("⏳ Slow down...")
+    cooldown[user_id] = time.time()
+
+    # cache
+    if url in cache:
+        return await message.reply_video(cache[url])
 
     msg = await message.reply("🔍 Fetching info...")
-    user_data[user_id] = {"url": url}
 
-    # Send quality options
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🎥 HD", callback_data="hd"))
-    keyboard.add(InlineKeyboardButton("📱 SD", callback_data="sd"))
-    keyboard.add(InlineKeyboardButton("🎧 Audio", callback_data="audio"))
+    try:
+        ydl = yt_dlp.YoutubeDL({"quiet": True})
+        info = ydl.extract_info(url, download=False)
 
-    await msg.delete()
-    await message.reply(
-        "Choose quality:",
-        reply_markup=keyboard
-    )
+        title = info.get("title", "YouTube Video")
+        thumb = info.get("thumbnail")
 
-# =========================
-# Button handler
-# =========================
-@dp.callback_query_handler(lambda c: True)
-async def handle_buttons(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    choice = call.data
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎥 HD", callback_data=f"hd|{url}"),
+                InlineKeyboardButton(text="📱 SD", callback_data=f"sd|{url}")
+            ],
+            [
+                InlineKeyboardButton(text="🎧 Audio", callback_data=f"audio|{url}")
+            ]
+        ])
 
-    data = user_data.get(user_id)
-    if not data:
-        return await call.message.reply("❌ Send the link again")
+        await msg.delete()
+        await message.reply_photo(
+            thumb,
+            caption=f"🎬 {title}\nChoose quality:",
+            reply_markup=kb
+        )
 
-    asyncio.create_task(process(call.message, data["url"], user_id, choice))
+    except Exception as e:
+        print("Fetch error:", e)
+        await msg.edit_text("❌ Failed to fetch info.")
+
+# -------------------------------
+# BUTTON HANDLER
+# -------------------------------
+@dp.callback_query()
+async def buttons(call: types.CallbackQuery):
+    choice, url = call.data.split("|")
+    asyncio.create_task(process(call.message, url, call.from_user.id, choice))
     await call.answer()
 
-# =========================
-# Process download queue
-# =========================
+# -------------------------------
+# PROCESS DOWNLOAD
+# -------------------------------
 async def process(message, url, user_id, choice):
     async with semaphore:
-        msg = await message.reply("⏳ Queued...")
+        msg = await message.answer("⏳ Processing...")
 
-        try:
-            await msg.edit_text("⬇️ Downloading...")
-            loop = asyncio.get_event_loop()
-            file_path, info = await loop.run_in_executor(
-                None, lambda: download_video(url, user_id, choice)
-            )
+        loop = asyncio.get_event_loop()
 
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if size_mb > 49:
+        for attempt in range(3):
+            try:
+                await msg.edit_text(f"⬇️ Downloading ({attempt+1}/3)")
+
+                file_path = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: download_video(url, user_id, choice)),
+                    timeout=180
+                )
+
+                size = os.path.getsize(file_path) / (1024 * 1024)
+                if size > 90:
+                    os.remove(file_path)
+                    return await msg.edit_text("❌ File too large")
+
+                await msg.edit_text("📤 Uploading...")
+
+                file = FSInputFile(file_path)
+                sent = await message.answer_video(file)
+
+                cache[url] = sent.video.file_id
                 os.remove(file_path)
-                return await msg.edit_text("❌ File too large (>49MB)")
 
-            await msg.edit_text("📤 Uploading...")
+                data = load_data()
+                data["downloads"] += 1
+                save_data(data)
 
-            if choice == "audio":
-                await message.reply_audio(InputFile(file_path))
-            else:
-                await message.reply_video(InputFile(file_path))
+                return await msg.edit_text("✅ Done")
 
-            os.remove(file_path)
-            await msg.edit_text("✅ Done!\n📥 Save to gallery")
+            except Exception as e:
+                print("Retry fail:", e)
+                await asyncio.sleep(1)
+
+        await msg.edit_text("❌ Failed after retries")
+
+# -------------------------------
+# MAIN (AUTO-RESTART)
+# -------------------------------
+async def main():
+    while True:
+        try:
+            print("🚀 YouTube Bot running...")
+
+            await start_web()
+            await dp.start_polling(bot)
 
         except Exception as e:
-            print("PROCESS ERROR:", e)
-            await msg.edit_text(f"❌ Failed: {e}")
+            print("💥 Crash:", e)
+            await asyncio.sleep(5)
 
-# =========================
-# Start polling
-# =========================
-print("🔥 YouTube bot running...")
-executor.start_polling(dp)
+# -------------------------------
+# START
+# -------------------------------
+if _name_ == "_main_":
+    asyncio.run(main())
